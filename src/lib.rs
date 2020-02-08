@@ -95,7 +95,7 @@ impl Compresstimator {
 
     /// Compresstimate the seekable stream `input` of `len` bytes, returning an
     /// estimated conservative compress ratio (based on lz4 level 1).
-    pub fn compresstimate<P: Read + Seek>(&self, mut input: P, len: u64) -> io::Result<f32> {
+    pub fn compresstimate_len<R: Read + Seek>(&self, mut input: R, len: u64) -> io::Result<f32> {
         let output = WriteCount::default();
 
         let mut encoder = EncoderBuilder::new().level(1).build(output)?;
@@ -107,6 +107,7 @@ impl Compresstimator {
         // If we're going to be randomly sampling a big chunk of the file anyway,
         // we might as well read in the lot.
         if samples == 0 || len < samples * self.block_size * 4 {
+            let _ = input.seek(SeekFrom::Start(0))?;
             written = std::io::copy(&mut input, &mut encoder)?;
         } else {
             let step = self.block_size * (blocks / samples);
@@ -125,21 +126,37 @@ impl Compresstimator {
         result.map(|_| output.written as f32 / written as f32)
     }
 
-    /// Compresstimate a path with a known file length.
+    /// Compresstimate the seekable stream `input` of unknown size, returning an
+    /// estimated conservative compress ratio (based on lz4 level 1).
+    pub fn compresstimate<R: Read + Seek>(&self, mut input: R) -> io::Result<f32> {
+        let len = input.seek(SeekFrom::End(0))?;
+        self.compresstimate_len(input, len)
+    }
+
     pub fn compresstimate_file_len<P: AsRef<Path>>(&self, path: P, len: u64) -> io::Result<f32> {
-        self.compresstimate(File::open(path)?, len)
+        self._compresstimate_file_len(path.as_ref(), len)
+    }
+
+    fn _compresstimate_file_len(&self, path: &Path, len: u64) -> io::Result<f32> {
+        let input = File::open(path)?;
+        self.compresstimate_len(input, len)
     }
 
     /// Compresstimate a path.
     pub fn compresstimate_file<P: AsRef<Path>>(&self, path: P) -> io::Result<f32> {
+        self._compresstimate_file(path.as_ref())
+    }
+
+    /// Compresstimate a path.
+    fn _compresstimate_file(&self, path: &Path) -> io::Result<f32> {
         let input = File::open(path)?;
         let len = input.metadata()?.len();
-        self.compresstimate(input, len)
+        self.compresstimate_len(input, len)
     }
 }
 
 #[test]
-fn amazing_test_suite() {
+fn test_real_files() {
     let est = Compresstimator::default();
 
     assert!(est.compresstimate_file("Cargo.lock").expect("Cargo.lock") < 1.0);
@@ -147,4 +164,22 @@ fn amazing_test_suite() {
     if std::path::PathBuf::from("/dev/urandom").exists() {
         assert!(est.compresstimate_file_len("/dev/urandom", 1024 * 1024).expect("/dev/urandom") >= 1.0);
     }
+}
+
+#[test]
+fn test_repeated_estimates() {
+    use std::convert::TryInto;
+
+    let est = Compresstimator::default();
+    let file: &[u8] = include_bytes!("../Cargo.lock");
+    let len: u64 = file.len().try_into().unwrap();
+    let mut file = io::Cursor::new(file);
+
+    let estimate1 = est.compresstimate(&mut file).unwrap();
+    let estimate2 = est.compresstimate(&mut file).unwrap();
+    let sized_estimate = est.compresstimate_len(&mut file, len as u64).unwrap();
+
+    assert!(estimate1 < 1.0);
+    assert_eq!(estimate1, estimate2);
+    assert_eq!(sized_estimate, estimate2);
 }
